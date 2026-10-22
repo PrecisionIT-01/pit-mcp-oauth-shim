@@ -14,6 +14,15 @@ D1-D4 / R1-R7 from `pit-mcp-dcr-shim/context/spec.md`:
 - Protected-resource metadata served at both well-known paths (R4).
 - Loopback `redirect_uri` support — `http://127.0.0.1:<port>/...` and
   `http://localhost:<port>/...` — for Claude Code's local OAuth flow (R6).
+- Claude desktop app callback (1.3.0) — exactly
+  `claude://claude.ai/mcp-auth-callback`, optionally followed by one path
+  segment of letters, digits, `_` or `-` (observed form: `/sdk`). Handled like
+  loopback: the Entra leg ends at the gateway's own callback, then the browser
+  is re-redirected to the caller. Case-sensitive; no query string, fragment,
+  port, user info, other host, other scheme or extra path. Every other
+  `redirect_uri` (including `https://claude.ai/api/mcp/auth_callback`) passes
+  through unchanged and Entra enforces its own exact match. Do not widen this
+  to a pattern.
 
 ## What it does NOT touch
 
@@ -45,10 +54,11 @@ redirect URI of the literal string `http://localhost` (no port), which
 matches `localhost` only, never `127.0.0.1` — and Claude Code has moved to
 `127.0.0.1`. So a naive pass-through `/authorize` that just forwards
 whatever `redirect_uri` the client sent will get rejected by Entra itself for
-any loopback caller, regardless of what this shim's own code does. This
+any loopback caller (and the Claude desktop app's `claude://` callback, which
+no Entra Web app registers), regardless of what this shim's own code does. This
 module works around that by terminating the Entra leg at the gateway's own
 already-registered `/oauth/callback` and re-redirecting the browser to the
-caller's real loopback URL itself afterward — see `index.js`'s top comment
+caller's real loopback or Claude desktop app URL itself afterward — see `index.js`'s top comment
 and `pit-mcp-dcr-shim/context/decisions.md` D-008 for the full reasoning.
 
 ## Usage (express)
@@ -72,7 +82,7 @@ const body = fixupTokenRedirectUri(passthroughBodyFromClient);
 
 The host gateway keeps its own `/token` handler (it already owns attaching
 `client_secret` and calling Entra) — this module only corrects
-`redirect_uri` on codes it issued via the loopback swap. Non-loopback token
+`redirect_uri` on codes it issued via the loopback or Claude-desktop swap. Other token
 exchanges (claude.ai's fixed callback) pass through `fixupTokenRedirectUri`
 unchanged.
 

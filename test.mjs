@@ -91,6 +91,7 @@ async function run() {
 
   server.close();
 
+  await runClaudeDesktopCallback();
   await runCallbackPathOverride();
   await runAsyncCredentials();
   await runAsyncScope();
@@ -262,6 +263,68 @@ async function runRawAdapter() {
   const cb = await fetch(local(`/oauth/callback?code=RAWCODE&state=${internalState}`), { redirect: 'manual' });
   const cbLoc = new URL(cb.headers.get('location'));
   assert(cbLoc.origin + cbLoc.pathname === 'http://127.0.0.1:9999/cb' && cbLoc.searchParams.get('code') === 'RAWCODE', 'raw adapter: callback redirects back to the caller with the real code');
+
+  server.close();
+}
+
+// 1.3.0: the Claude desktop app's claude:// callback is handled like loopback
+// (exact allowlist); every near-miss must pass through to Entra untouched.
+async function runClaudeDesktopCallback() {
+  const base = 'https://desktop-mcp.myprecisionit.com';
+  const app = express();
+  app.use(express.json());
+  const { fixupTokenRedirectUri, ownCallbackUrl } = mountOAuthShim(app, {
+    tenantId: 'T', clientId: 'C', clientSecret: 'S', gatewayBaseUrl: base,
+    entraScope: 'api://AUD/mcp.access',
+  });
+  const server = app.listen(0);
+  await new Promise((r) => server.once('listening', r));
+  const port = server.address().port;
+  const local = (p) => `http://127.0.0.1:${port}${p}`;
+  const authorize = async (redirectUri, state) => {
+    const res = await fetch(local(`/authorize?response_type=code&client_id=probe&redirect_uri=${encodeURIComponent(redirectUri)}&state=${state}&code_challenge=abc&code_challenge_method=S256`), { redirect: 'manual' });
+    return new URL(res.headers.get('location'));
+  };
+
+  for (const [i, uri] of ['claude://claude.ai/mcp-auth-callback/sdk', 'claude://claude.ai/mcp-auth-callback'].entries()) {
+    const loc = await authorize(uri, `DESK${i}`);
+    assert(loc.host === 'login.microsoftonline.com', `desktop ${uri}: goes to Entra`);
+    assert(loc.searchParams.get('redirect_uri') === ownCallbackUrl, `desktop ${uri}: Entra gets the gateway's own callback`);
+    const internalState = loc.searchParams.get('state');
+    assert(internalState !== `DESK${i}`, `desktop ${uri}: state is swapped to an internal key`);
+
+    const cb = await fetch(local(`/oauth/callback?code=DESKCODE${i}&state=${internalState}`), { redirect: 'manual' });
+    assert(cb.status === 302, `desktop ${uri}: callback redirects`);
+    const cbLoc = new URL(cb.headers.get('location'));
+    assert(cbLoc.protocol === 'claude:' && cbLoc.host === 'claude.ai' && cbLoc.pathname === new URL(uri).pathname, `desktop ${uri}: callback returns to the caller's claude:// address`);
+    assert(cbLoc.searchParams.get('code') === `DESKCODE${i}`, `desktop ${uri}: callback forwards the code`);
+    assert(cbLoc.searchParams.get('state') === `DESK${i}`, `desktop ${uri}: callback restores the caller's state`);
+    assert(cbLoc.searchParams.get('iss') === base, `desktop ${uri}: callback sets iss`);
+    const fixed = fixupTokenRedirectUri({ code: `DESKCODE${i}`, redirect_uri: uri });
+    assert(fixed.redirect_uri === ownCallbackUrl, `desktop ${uri}: token redirect_uri is rewritten to the gateway callback`);
+  }
+
+  const passThrough = [
+    'https://claude.ai/api/mcp/auth_callback',
+    'claude://evil.example/mcp-auth-callback/sdk',
+    'claude://claude.ai.evil.example/mcp-auth-callback/sdk',
+    'claude://claude.ai/other',
+    'claude://claude.ai/mcp-auth-callback/sdk/extra',
+    'claude://claude.ai/mcp-auth-callback/sdk?x=1',
+    'claude://claude.ai/mcp-auth-callback/sdk#f',
+    'claude://user@claude.ai/mcp-auth-callback/sdk',
+    'claude://claude.ai:443/mcp-auth-callback/sdk',
+    'CLAUDE://claude.ai/mcp-auth-callback/sdk',
+    'claude://Claude.ai/mcp-auth-callback/sdk',
+    'claude://claude.ai/mcp-auth-callback/sdk\n',
+  ];
+  for (const uri of passThrough) {
+    const loc = await authorize(uri, 'probe1');
+    assert(loc.searchParams.get('redirect_uri') === uri && loc.searchParams.get('state') === 'probe1', `pass-through unchanged: ${JSON.stringify(uri)}`);
+  }
+
+  const lb = await authorize('http://127.0.0.1:5555/cb', 'LB');
+  assert(lb.searchParams.get('redirect_uri') === ownCallbackUrl && lb.searchParams.get('state') !== 'LB', 'loopback is still swapped');
 
   server.close();
 }

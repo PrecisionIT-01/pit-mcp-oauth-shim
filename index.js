@@ -11,15 +11,22 @@
 //     gateway, not Entra, is the authorization server the client talks to).
 //   - Protected-resource metadata (RFC 9728) is served at both the root
 //     well-known path and the path-suffixed form under /mcp.
-//   - /authorize supports loopback redirect_uri forms (127.0.0.1 and
-//     localhost, any port) by terminating the Entra leg at THIS gateway's
-//     own already-registered callback and re-redirecting the browser back to
-//     the caller's real loopback URL itself. Entra requires an exact-match
+//   - /authorize supports exactly two caller-address forms by terminating the
+//     Entra leg at THIS gateway's own already-registered callback and
+//     re-redirecting the browser back to the caller's real address itself:
+//       (a) loopback redirect_uris (127.0.0.1 and localhost, any port);
+//       (b) the Claude desktop app's callback, exactly
+//           claude://claude.ai/mcp-auth-callback, optionally followed by one
+//           path segment of letters, digits, underscore or hyphen (the
+//           observed form ends in /sdk). Case-sensitive; no query, fragment,
+//           port, user info, other host, other scheme or extra path. (1.3.0)
+//     Entra requires an exact-match
 //     registered redirect URI and has no port-wildcarding for 127.0.0.1, so a
 //     bare allowlist check on the incoming redirect_uri is not sufficient —
 //     see pit-mcp-dcr-shim/context/decisions.md D-008 for why this shape was
-//     chosen. Non-loopback callers (claude.ai's fixed web callback) are
-//     untouched: same pass-through behavior as before, zero regression risk.
+//     chosen. Every other caller (claude.ai's fixed web callback included) is
+//     untouched: same pass-through behavior as before, so Entra's own
+//     exact-match check still applies to it. Never widen (b) to a pattern.
 //
 // Requires ONE new Web-platform redirect URI added to the gateway's existing
 // Entra app registration: `${gatewayBaseUrl}${callbackPath}` (callbackPath
@@ -55,6 +62,10 @@
 const { randomUUID } = require('node:crypto');
 
 const LOOPBACK_REDIRECT_RE = /^https?:\/\/(127\.0\.0\.1|localhost)(:\d+)?(\/|$)/i;
+// The Claude desktop app's custom-scheme callback. Deliberately an exact
+// allowlist, case-sensitive and anchored at both ends: handing sign-in codes
+// to any other address would let a caller choose where codes go.
+const CLAUDE_DESKTOP_REDIRECT_RE = /^claude:\/\/claude\.ai\/mcp-auth-callback(\/[A-Za-z0-9_-]+)?$/;
 const PENDING_AUTHORIZE_TTL_MS = 10 * 60 * 1000; // generous: a human completing an Entra login
 const PENDING_TOKEN_FIXUP_TTL_MS = 5 * 60 * 1000; // Entra auth codes are short-lived
 
@@ -137,7 +148,7 @@ function createOAuthShimCore(opts) {
 
   // RFC 7591 compatibility stub — mints nothing, persists nothing. Echoes
   // back whatever redirect_uris the caller asked for; real enforcement is
-  // the loopback check in handleAuthorize below, not this response.
+  // the swap check in handleAuthorize below, not this response.
   async function handleRegister(body) {
     const id = await resolveValue(clientId);
     const requestedRedirectUris = Array.isArray(body?.redirect_uris) ? body.redirect_uris : [];
@@ -157,7 +168,8 @@ function createOAuthShimCore(opts) {
     const id = await resolveValue(clientId);
     const scope = await resolveValue(entraScope);
     const requestedRedirectUri = getParam(query, 'redirect_uri');
-    const isLoopback = typeof requestedRedirectUri === 'string' && LOOPBACK_REDIRECT_RE.test(requestedRedirectUri);
+    const isSwapped = typeof requestedRedirectUri === 'string'
+      && (LOOPBACK_REDIRECT_RE.test(requestedRedirectUri) || CLAUDE_DESKTOP_REDIRECT_RE.test(requestedRedirectUri));
 
     const params = new URLSearchParams(query);
     params.set('client_id', id);
@@ -166,13 +178,14 @@ function createOAuthShimCore(opts) {
     // audience (AADSTS9010010) — strip it, same as before this module existed.
     params.delete('resource');
 
-    if (!isLoopback) {
-      // claude.ai's fixed web callback, or anything else not a loopback form:
-      // unchanged pass-through behavior, exactly as before this module.
+    if (!isSwapped) {
+      // claude.ai's fixed web callback, or anything else that is neither a
+      // loopback form nor the Claude desktop app's callback: unchanged
+      // pass-through behavior, exactly as before this module.
       return { redirectUrl: `${entraBase}/oauth2/v2.0/authorize?${params.toString()}` };
     }
 
-    // Loopback: Entra only recognizes ownCallbackUrl as a registered redirect
+    // Loopback or Claude desktop app: Entra only recognizes ownCallbackUrl as a registered redirect
     // for this app. Swap it in, remember the caller's real redirect_uri and
     // state, and hand back control at the callback route below.
     sweep(pendingAuthorize, PENDING_AUTHORIZE_TTL_MS);
